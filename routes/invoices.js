@@ -10,6 +10,7 @@ const { priceInvoice, bad } = require('../utils/pricing');
 
 router.use(protect);
 
+const MAX_PROOFS = 5;
 const isAdmin = (req) => req.user.role === 'admin';
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Staff only ever see their own invoices that are not deleted.
@@ -18,18 +19,25 @@ const scope = (req) => (isAdmin(req) ? {} : { createdBy: req.user._id, isDeleted
 const hideCost = (req) => (isAdmin(req) ? {} : { 'items.officialPrice': 0, 'items.ownerLine': 0, ownerAmount: 0, staffProfit: 0 });
 const putBack = (lines) => Promise.all(lines.map((l) => Product.updateOne({ _id: l.product }, { $inc: { stock: l.quantity } })));
 
+// Up to 5 images per invoice. Turns multer's cryptic errors into plain messages.
+const uploadProofs = (req, res, next) =>
+  upload.array('paymentProof', MAX_PROOFS)(req, res, (err) => {
+    if (err?.code === 'LIMIT_UNEXPECTED_FILE') return next(bad(`You can attach up to ${MAX_PROOFS} payment proofs`));
+    next(err);
+  });
+
 async function nextInvoiceNo() {
   const c = await Counter.findOneAndUpdate({ _id: 'invoice' }, { $inc: { seq: 1 } }, { new: true, upsert: true });
   return { seq: c.seq, no: `${process.env.INVOICE_PREFIX || 'SLK'}-${String(c.seq).padStart(4, '0')}` };
 }
 
 /* ---------- Create ---------- */
-router.post('/', upload.single('paymentProof'), async (req, res, next) => {
-  let reserved = [], proof, seq, saved = false;
+router.post('/', uploadProofs, async (req, res, next) => {
+  let reserved = [], proofs = [], seq, saved = false;
   try {
     const { customerName, customerPhone = '', orderDate } = req.body;
     if (!customerName?.trim()) throw bad('Customer name is required');
-    if (!req.file) throw bad('Payment proof is required. Upload the screenshot or receipt');
+    if (!req.files?.length) throw bad('Payment proof is required. Upload at least one screenshot or receipt');
 
     let raw;
     try { raw = JSON.parse(req.body.items || '[]'); } catch { raw = []; }
@@ -67,11 +75,13 @@ router.post('/', upload.single('paymentProof'), async (req, res, next) => {
     }
 
     try {
-      const up = await uploadProof(req.file.buffer);
-      proof = { publicId: up.public_id, originalName: req.file.originalname, mimeType: req.file.mimetype };
+      for (const f of req.files) {
+        const up = await uploadProof(f.buffer);
+        proofs.push({ publicId: up.public_id, originalName: f.originalname, mimeType: f.mimetype });
+      }
     } catch (err) {
       console.error('Cloudinary upload failed:', err.message);
-      throw bad('Could not upload the payment proof. Please try again', 502);
+      throw bad('Could not upload the payment proofs. Please try again', 502);
     }
 
     const num = await nextInvoiceNo();
@@ -81,7 +91,7 @@ router.post('/', upload.single('paymentProof'), async (req, res, next) => {
       invoiceNo: num.no,
       customer: { name: customerName.trim(), phone: customerPhone.trim() },
       orderDate: date,
-      paymentProof: proof,
+      paymentProofs: proofs,
       createdBy: req.user._id,
       createdByName: req.user.name,
       createdByRole: req.user.role,
@@ -104,7 +114,7 @@ router.post('/', upload.single('paymentProof'), async (req, res, next) => {
     // Undo everything this request did, but only if the invoice itself was not saved.
     if (!saved) {
       if (reserved.length) await putBack(reserved).catch(() => {});
-      if (proof) await removeProof(proof.publicId);
+      for (const p of proofs) await removeProof(p.publicId);
       if (seq) await Counter.updateOne({ _id: 'invoice', seq }, { $inc: { seq: -1 } }).catch(() => {});
     }
     next(e);
@@ -114,13 +124,14 @@ router.post('/', upload.single('paymentProof'), async (req, res, next) => {
 /* ---------- List (search + filters) ---------- */
 router.get('/', async (req, res, next) => {
   try {
-    const { search, status, staff, from, to } = req.query;
+    const { search, status, delivery, staff, from, to } = req.query;
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(50, parseInt(req.query.limit) || 15);
 
     const q = scope(req);
     if (isAdmin(req)) q.isDeleted = req.query.deleted === 'true' ? true : { $ne: true };
     if (['paid', 'partial', 'unpaid'].includes(status)) q.status = status;
+    if (['pending', 'delivered'].includes(delivery)) q.deliveryStatus = delivery;
     if (staff && isAdmin(req)) q.createdBy = staff;
     if (from || to) {
       q.orderDate = {};
@@ -142,12 +153,12 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-/* ---------- Single invoice + payment proof ---------- */
-router.get('/:id/proof', async (req, res, next) => {
+/* ---------- Payment proofs (signed links, one per image) ---------- */
+router.get('/:id/proofs', async (req, res, next) => {
   try {
     const inv = await Invoice.findOne({ _id: req.params.id, ...scope(req) });
-    if (!inv?.paymentProof?.publicId) return res.status(404).json({ message: 'No payment proof for this invoice' });
-    res.json({ url: signedUrl(inv.paymentProof.publicId) });
+    if (!inv) return res.status(404).json({ message: 'Invoice not found' });
+    res.json({ urls: inv.paymentProofs.map((p) => signedUrl(p.publicId)) });
   } catch (e) {
     next(e);
   }
@@ -163,8 +174,29 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
+/* ---------- Mark delivered ---------- */
+// A team member can mark their OWN invoice delivered. Only the owner can undo it.
+router.patch('/:id/deliver', async (req, res, next) => {
+  try {
+    const delivered = req.body.delivered !== false;
+    if (!delivered && !isAdmin(req)) return res.status(403).json({ message: 'Only the owner can undo a delivery' });
+
+    const filter = { _id: req.params.id, ...scope(req), isDeleted: { $ne: true } };
+    if (delivered) filter.deliveryStatus = { $ne: 'delivered' }; // keeps the original delivery time
+    const update = delivered
+      ? { $set: { deliveryStatus: 'delivered', deliveredAt: new Date(), deliveredByName: req.user.name } }
+      : { $set: { deliveryStatus: 'pending' }, $unset: { deliveredAt: 1, deliveredByName: 1 } };
+
+    const inv = await Invoice.findOneAndUpdate(filter, update, { new: true, projection: hideCost(req) }).populate('createdBy', 'name username');
+    if (!inv) return res.status(404).json({ message: 'Invoice not found, deleted, or already delivered' });
+    res.json(inv);
+  } catch (e) {
+    next(e);
+  }
+});
+
 /* ---------- Delete (owner only) ---------- */
-// The record and its payment proof are kept for the books. Marking it deleted puts the kites
+// The record and its payment proofs are kept for the books. Marking it deleted puts the kites
 // back in stock and removes its sales and profit from every total.
 router.delete('/:id', adminOnly, async (req, res, next) => {
   try {

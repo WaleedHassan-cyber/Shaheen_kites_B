@@ -1,4 +1,11 @@
 const mongoose = require('mongoose');
+const crypto = require('crypto');
+
+// 12 characters, no look-alikes (0/O, 1/I). Printed on the invoice and inside its QR code.
+const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const makeCode = () => Array.from(crypto.randomBytes(12), (b) => CODE_CHARS[b % CODE_CHARS.length]).join('');
+
+const proofSchema = new mongoose.Schema({ publicId: { type: String, required: true }, originalName: String, mimeType: String }, { _id: false });
 
 // Price and name are copied onto each line so old invoices never change
 // when the admin edits prices later.
@@ -29,7 +36,11 @@ const invoiceSchema = new mongoose.Schema(
     amountPaid: { type: Number, required: true, min: 0 },
     balance: { type: Number, required: true, min: 0 },
     status: { type: String, enum: ['paid', 'partial', 'unpaid'], required: true },
-    paymentProof: { publicId: { type: String, required: true }, originalName: String, mimeType: String },
+    paymentProofs: { type: [proofSchema], validate: [(v) => v.length > 0, 'At least one payment proof is required'] },
+    verifyCode: { type: String, unique: true, sparse: true, default: makeCode }, // lets anyone check the invoice is real
+    deliveryStatus: { type: String, enum: ['pending', 'delivered'], default: 'pending', index: true },
+    deliveredAt: Date,
+    deliveredByName: String,
     // Name copied at creation so the invoice still shows who made it even if that account is ever removed.
     createdByName: { type: String, default: '' },
     ownerAmount: { type: Number, default: 0 }, // owner's share (official prices for staff sales)

@@ -24,6 +24,7 @@ app.use('/api/users', require('./routes/users'));
 app.use('/api/products', require('./routes/products'));
 app.use('/api/invoices', require('./routes/invoices'));
 app.use('/api/inventory', require('./routes/inventory'));
+app.use('/api/verify', require('./routes/verify'));
 app.use('/api/stats', require('./routes/stats'));
 
 // Central error handler
