@@ -1,11 +1,22 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const Invoice = require('../models/Invoice');
+const { protect } = require('../middleware/auth');
 
-// PUBLIC route (no login): lets a customer check that an invoice is real.
-// It shows only what is needed to compare with the paper invoice. No phone number,
-// no unit prices, no payment proof, nothing about the owner's share.
-router.use(rateLimit({ windowMs: 60 * 1000, max: 30, message: { message: 'Too many checks. Please try again in a minute' } }));
+// TEAM ONLY (owner and team members). Without a valid login the server answers 401,
+// so a customer who scans the QR cannot see any invoice data.
+router.use(protect);
+router.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    keyGenerator: (req) => String(req.user._id), // counted per person, not per internet address
+    message: { message: 'Too many checks. Please try again in a minute' },
+  })
+);
+
+// Shows only what is needed to match the paper invoice. No phone number, no unit prices,
+// no payment proof, nothing about the owner's share or anyone's profit.
 
 // "Ali Raza" -> "Ali R."
 const maskName = (name = '') => {
